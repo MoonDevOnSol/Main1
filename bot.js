@@ -138,7 +138,7 @@ bot.onText(/\/create_token/, msg => {
 
 // REFERRAL LINK
 bot.onText(/\/ref/, msg => {
-  bot.sendMessage(msg.chat.id, `Your link: https://t.me/YOUR_BOT_USERNAME?start=${msg.from.id}`);
+  bot.sendMessage(msg.chat.id, `Your link: https://t.me/SnipeRaydium_Bot?start=${msg.from.id}`);
 });
 
 // PRICE COMMANDS
