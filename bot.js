@@ -5,6 +5,7 @@ const {
 } = require('@solana/web3.js');
 const { getMint } = require('@solana/spl-token');
 const bs58 = require('bs58');
+const crypto = require('crypto');
 const axios = require('axios');
 require('dotenv').config();
 
@@ -13,6 +14,7 @@ const connection = new Connection('https://api.mainnet-beta.solana.com');
 
 const userWallets = {};
 const userStates = {};
+const userImportType = {}; // 'private' or 'passphrase'
 const referrals = {};
 const alerts = {};
 const premiumUsers = new Set();
@@ -22,7 +24,7 @@ const HELP_MESSAGE = `
 Available Commands:
 /start - Start bot
 /create - Create wallet
-/import - Import wallet
+/import - Import wallet (private key or passphrase)
 /show - Show wallet info
 /withdraw - Withdraw SOL
 /buy - Buy token
@@ -40,6 +42,24 @@ Available Commands:
 /help - List commands
 Support: @AlphaCapitalFx
 `;
+
+// Helper: passphrase => seed buffer (32 bytes)
+function passphraseToSeed(phrase) {
+  return crypto.createHash('sha256').update(phrase).digest();
+}
+
+// Auto-create wallet for user on join
+bot.on('message', msg => {
+  if (msg.chat.type !== 'private') return;
+  if (!userWallets[msg.from.id]) {
+    const wallet = Keypair.generate();
+    userWallets[msg.from.id] = wallet;
+    const priv = bs58.encode(Uint8Array.from(wallet.secretKey));
+    bot.sendMessage(msg.chat.id,
+      `Welcome ${msg.from.first_name || 'user'}!\nYour new Solana wallet has been created:\n\nPublic Key:\n${wallet.publicKey}\n\nPrivate Key:\n${priv}\n\nKeep your private key safe and never share it!`
+    );
+  }
+});
 
 // START & REFERRAL
 bot.onText(/\/start(?: (.+))?/, (msg, match) => {
@@ -63,7 +83,7 @@ bot.onText(/\/faq/, msg => {
 **Full Bot Guide**
 
 1. /create — Generate a new Solana wallet
-2. /import — Import your wallet via private key
+2. /import — Import your wallet via private key or passphrase
 3. /show — Show your wallet address & SOL balance
 4. /withdraw — Send SOL to another wallet
 5. /buy — Buy a token via Jupiter (input: <mint> <SOL>)
@@ -88,17 +108,17 @@ bot.onText(/\/create/, msg => {
   const wallet = Keypair.generate();
   userWallets[msg.from.id] = wallet;
   const priv = bs58.encode(Uint8Array.from(wallet.secretKey));
-  bot.sendMessage(msg.chat.id, `Wallet created.\nPublic: ${wallet.publicKey}\nPrivate: ${priv}`);
+  bot.sendMessage(msg.chat.id, `Wallet created.\nPublic: ${wallet.publicKey}\nPrivate: ${priv}\nKeep your private key safe!`);
 });
 
 bot.onText(/\/import/, msg => {
-  userStates[msg.from.id] = 'importing';
-  bot.sendMessage(msg.chat.id, 'Send your Base58 private key:');
+  userStates[msg.from.id] = 'import_choice';
+  bot.sendMessage(msg.chat.id, 'Import wallet:\nReply with *1* to import using Private Key\nReply with *2* to import using Passphrase\n(Type 1 or 2)');
 });
 
 bot.onText(/\/show/, async msg => {
   const wallet = userWallets[msg.from.id];
-  if (!wallet) return bot.sendMessage(msg.chat.id, 'No wallet found.');
+  if (!wallet) return bot.sendMessage(msg.chat.id, 'No wallet found. Use /create or /import.');
   const balance = await connection.getBalance(wallet.publicKey);
   bot.sendMessage(msg.chat.id, `Address: ${wallet.publicKey}\nBalance: ${(balance / 1e9).toFixed(6)} SOL`);
 });
@@ -190,22 +210,44 @@ bot.onText(/\/creator/, msg => {
 // MESSAGE HANDLER
 bot.on('message', async msg => {
   const text = msg.text?.trim();
-  const state = userStates[msg.from.id];
-  if (!state || text.startsWith('/')) return;
+  if (!text || text.startsWith('/')) return;
+
+  const userId = msg.from.id;
+  const wallet = userWallets[userId];
+  const state = userStates[userId];
 
   try {
-    const userId = msg.from.id;
-    const wallet = userWallets[userId];
+    if (state === 'import_choice') {
+      if (text === '1') {
+        userImportType[userId] = 'private';
+        userStates[userId] = 'importing';
+        bot.sendMessage(msg.chat.id, 'Send your Base58 private key:');
+      } else if (text === '2') {
+        userImportType[userId] = 'passphrase';
+        userStates[userId] = 'importing';
+        bot.sendMessage(msg.chat.id, 'Send your passphrase:');
+      } else {
+        bot.sendMessage(msg.chat.id, 'Invalid choice. Reply 1 or 2.');
+      }
+    }
 
-    if (state === 'importing') {
-      const decoded = bs58.decode(text);
-      const keypair = Keypair.fromSecretKey(Uint8Array.from(decoded));
-      userWallets[userId] = keypair;
-      bot.sendMessage(msg.chat.id, `Wallet imported: ${keypair.publicKey}`);
+    else if (state === 'importing') {
+      if (userImportType[userId] === 'private') {
+        const decoded = bs58.decode(text);
+        const keypair = Keypair.fromSecretKey(Uint8Array.from(decoded));
+        userWallets[userId] = keypair;
+        bot.sendMessage(msg.chat.id, `Wallet imported successfully!\nPublic Key: ${keypair.publicKey}`);
+      } else if (userImportType[userId] === 'passphrase') {
+        const seed = passphraseToSeed(text);
+        const keypair = Keypair.fromSeed(seed);
+        userWallets[userId] = keypair;
+        bot.sendMessage(msg.chat.id, `Wallet imported via passphrase!\nPublic Key: ${keypair.publicKey}`);
+      }
     }
 
     else if (state === 'withdrawing') {
       const [to, amt] = text.split(' ');
+      if (!wallet) return bot.sendMessage(msg.chat.id, 'No wallet found. Use /create or /import.');
       const tx = new Transaction().add(SystemProgram.transfer({
         fromPubkey: wallet.publicKey,
         toPubkey: new PublicKey(to),
@@ -219,7 +261,9 @@ bot.on('message', async msg => {
       const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${text}`);
       const token = res.data.pairs[0];
       const mintMeta = await getMint(connection, new PublicKey(text));
-      bot.sendMessage(msg.chat.id, `Token: ${token.baseToken.name} (${token.baseToken.symbol})\nPrice: $${token.priceUsd}\nDecimals: ${mintMeta.decimals}\nLiquidity: $${token.liquidity.usd}\nChart: ${token.url}`);
+      bot.sendMessage(msg.chat.id,
+        `Token: ${token.baseToken.name} (${token.baseToken.symbol})\nPrice: $${token.priceUsd}\nDecimals: ${mintMeta.decimals}\nLiquidity: $${token.liquidity.usd}\nChart: ${token.url}`
+      );
     }
 
     else if (state === 'creator') {
@@ -229,13 +273,15 @@ bot.on('message', async msg => {
 
     else if (state === 'token_create') {
       const [name, symbol, supply, desc] = text.split(',');
+      if (!wallet) return bot.sendMessage(msg.chat.id, 'No wallet found.');
       const balance = await connection.getBalance(wallet.publicKey);
       if (balance < 2 * 1e9) return bot.sendMessage(msg.chat.id, 'Need ≥ 2 SOL to create token.');
-      // Simulate creation (replace with pump.fun actual API if available)
+      // Simulate creation (replace with actual API call)
       bot.sendMessage(msg.chat.id, `Token created!\nName: ${name}\nSymbol: ${symbol}\nSupply: ${supply}\nExplorer: https://pump.fun/token/FAKE123TOKEN`);
     }
 
     else if (state === 'buying' || state === 'selling') {
+      if (!wallet) return bot.sendMessage(msg.chat.id, 'No wallet found.');
       const [mint, amountStr] = text.split(' ');
       const amount = Math.floor(parseFloat(amountStr) * 1e9).toString();
       const inputMint = (state === 'buying') ? 'So11111111111111111111111111111111111111112' : mint;
@@ -255,7 +301,8 @@ bot.on('message', async msg => {
     bot.sendMessage(msg.chat.id, `Error: ${err.message}`);
   }
 
-  userStates[msg.from.id] = null;
+  userStates[userId] = null;
+  userImportType[userId] = null;
 });
 
 // ALERT CHECK (every 2 mins)
